@@ -8,9 +8,11 @@ Pipeline: webcam -> Robust Video Matting (ONNX) na GPU via DirectML
 Uso rápido:
     python camfundo.py --preview
     python camfundo.py --mode image --image fundo.jpg
-Teclas na janela de preview: b = blur, c = cor, i = imagem, n = sem efeito, q/Esc = sair
+Teclas na janela de preview: b = blur, c = cor, i = imagem, n = sem efeito,
+  + / - = BPM de teste, h = mostra/esconde o coração, q/Esc = sair
 """
 import argparse
+from collections import deque
 import os
 import sys
 import threading
@@ -190,6 +192,8 @@ class Grabber:
     def __init__(self, cap):
         self.cap = cap
         self.frame = None
+        self.ts = 0.0
+        self.frame_ts = 0.0   # instante (perf_counter) em que o frame lido foi capturado
         self.failed = False
         self.running = True
         self.new = threading.Event()
@@ -206,6 +210,7 @@ class Grabber:
                 return
             with self.lock:
                 self.frame = f
+                self.ts = time.perf_counter()
             self.new.set()
 
     def read(self):
@@ -213,6 +218,7 @@ class Grabber:
             return False, None
         with self.lock:
             f = self.frame
+            self.frame_ts = self.ts
         self.new.clear()
         return True, f
 
@@ -308,6 +314,390 @@ def set_low_priority():
     k.SetPriorityClass(k.GetCurrentProcess(), 0x00004000)  # BELOW_NORMAL_PRIORITY_CLASS
 
 
+FACE_MODEL = "face_detection_yunet_2023mar.onnx"
+FACE_URLS = [
+    "https://github.com/opencv/opencv_zoo/raw/fd2da740ebc6d0fe489d86cb55133148978cd82e/models/face_detection_yunet/" + FACE_MODEL,
+    "https://github.com/opencv/opencv_zoo/raw/main/models/face_detection_yunet/" + FACE_MODEL,
+]
+
+
+def ensure_face_model():
+    folder = os.path.join(os.path.dirname(os.path.abspath(__file__)), "models")
+    os.makedirs(folder, exist_ok=True)
+    path = os.path.join(folder, FACE_MODEL)
+    if os.path.exists(path) and os.path.getsize(path) > 100_000:
+        return path
+    print("Baixando modelo de rosto YuNet (só na primeira vez)...")
+    for url in FACE_URLS:
+        try:
+            urllib.request.urlretrieve(url, path + ".part")
+            if os.path.getsize(path + ".part") > 100_000:  # descarta arquivo-ponteiro do Git LFS
+                os.replace(path + ".part", path)
+                return path
+        except Exception as e:
+            print("  falhou:", e)
+    if os.path.exists(path + ".part"):
+        os.remove(path + ".part")
+    return None
+
+
+class YuNetDetector:
+    """Detector de rosto (OpenCV FaceDetectorYN). Devolve (x, y, w, h) do maior rosto."""
+
+    def __init__(self, model_path, width=320):
+        self.width = width
+        self.broken = False
+        self.det = cv2.FaceDetectorYN.create(model_path, "", (width, width), 0.7, 0.3, 5)
+
+    def detect(self, frame):
+        if self.broken:
+            return None
+        try:
+            h, w = frame.shape[:2]
+            s = self.width / w
+            small = cv2.resize(frame, (self.width, max(16, int(round(h * s)))), interpolation=cv2.INTER_AREA)
+            self.det.setInputSize((small.shape[1], small.shape[0]))
+            _, faces = self.det.detect(small)
+        except cv2.error:
+            self.broken = True
+            return None
+        if faces is None or len(faces) == 0:
+            return None
+        f = max(faces, key=lambda r: r[2] * r[3])
+        return (f[0] / s, f[1] / s, f[2] / s, f[3] / s)
+
+
+def build_face_detector():
+    path = ensure_face_model()
+    if path is None:
+        print("Não consegui baixar o modelo de rosto, então o BPM pela câmera fica desligado.\n"
+              f"Baixe {FACE_MODEL} do repositório opencv/opencv_zoo e coloque na pasta models/.")
+        return None
+    try:
+        det = YuNetDetector(path)
+        det.det.setInputSize((320, 180))
+        det.det.detect(np.zeros((180, 320, 3), np.uint8))  # teste de funcionamento
+        return det
+    except Exception as e:
+        print(f"Falha ao iniciar o detector de rosto ({e}).\n"
+              f"Seu OpenCV é o {cv2.__version__}. O modelo usado foi feito para o OpenCV 4.x; instale com:\n"
+              '    python -m pip install "opencv-python>=4.8,<5"')
+        return None
+
+
+def pos_signal(rgb, fs):
+    """Método POS (Wang et al., 2017): combina R, G e B para isolar o pulso e cancelar movimento.
+
+    Versão vetorizada: todas as janelas de 1,6 s são calculadas de uma vez e somadas com sobreposição.
+    """
+    n, l = len(rgb), int(1.6 * fs)
+    if n < l:
+        return np.zeros(n)
+    win = np.lib.stride_tricks.sliding_window_view(rgb, l, axis=0)          # (m, 3, l)
+    cn = win / (win.mean(axis=2, keepdims=True) + 1e-9)
+    s0 = cn[:, 1] - cn[:, 2]                                                # G - B
+    s1 = -2.0 * cn[:, 0] + cn[:, 1] + cn[:, 2]                              # -2R + G + B
+    h = s0 + (s0.std(axis=1, keepdims=True) / (s1.std(axis=1, keepdims=True) + 1e-9)) * s1
+    h -= h.mean(axis=1, keepdims=True)
+    m = h.shape[0]
+    out = np.zeros(n)
+    for j in range(l):                                                      # soma com sobreposição
+        out[j:j + m] += h[:, j]
+    # limita picos isolados (movimento, piscadas de luz) para não dominarem o espectro
+    k = 3.5 * 1.4826 * np.median(np.abs(out - np.median(out))) + 1e-12
+    return np.clip(out, -k, k)
+
+
+def power_spectrum(x, fs):
+    """Espectro de potência (com zero-padding) e o eixo de frequências em bpm."""
+    x = x - x.mean()
+    n = len(x)
+    nfft = 1 << int(np.ceil(np.log2(n * 8)))
+    p = np.abs(np.fft.rfft(x * np.hanning(n), nfft)) ** 2
+    return np.fft.rfftfreq(nfft, 1.0 / fs) * 60.0, p
+
+
+def peak_from_spectrum(f, p, lo_bpm, hi_bpm, around=None, radius=15.0):
+    """Maior pico (máximo local de verdade) entre lo_bpm e hi_bpm; com `around`, só perto desse valor.
+
+    Devolve (bpm, snr) ou None. Sem `around`, o ruído é medido em toda a faixa; com `around`, só
+    numa vizinhança de ±40 bpm do pico, para que uma interferência distante não derrube a leitura.
+    """
+    band = np.nonzero((f >= lo_bpm) & (f <= hi_bpm))[0]
+    if len(band) < 5:
+        return None
+    cand = band if around is None else band[np.abs(f[band] - around) <= radius]
+    cand = cand[(cand > 0) & (cand < len(p) - 1)]
+    cand = cand[(p[cand] >= p[cand - 1]) & (p[cand] >= p[cand + 1])]   # exclui "ladeiras" de outro pico
+    if len(cand) == 0:
+        return None
+    k = cand[np.argmax(p[cand])]
+    a, b, c = np.log(p[k - 1] + 1e-12), np.log(p[k] + 1e-12), np.log(p[k + 1] + 1e-12)   # refinamento parabólico
+    d = 0.5 * (a - c) / (a - 2 * b + c + 1e-12)
+    peak = f[k] + float(np.clip(d, -1, 1)) * (f[1] - f[0])
+    dist = np.abs(f[band] - peak)
+    near = dist <= 10.0
+    scope = np.ones_like(near) if around is None else dist <= 40.0
+    snr = p[band][near].sum() / max(p[band][~near & scope].sum(), 1e-12)
+    return float(peak), float(snr)
+
+
+def spectral_peak(x, fs, lo_bpm, hi_bpm, around=None, radius=15.0):
+    f, p = power_spectrum(x, fs)
+    return peak_from_spectrum(f, p, lo_bpm, hi_bpm, around, radius)
+
+
+class HeartRate:
+    """Estima o BPM pela variação de cor da pele do rosto (rPPG: testa e bochechas + método POS).
+
+    Melhorias de estabilidade: cada região (testa, bochecha esquerda, bochecha direita) é analisada
+    separadamente e as melhores pesam mais; depois de uma leitura confiável o programa "trava" na
+    frequência e só acompanha mudanças graduais (±15 bpm), em vez de saltar para ruído de outra faixa.
+    """
+
+    REGIONS = [(0.30, 0.05, 0.70, 0.27), (0.12, 0.50, 0.38, 0.74), (0.62, 0.50, 0.88, 0.74)]
+
+    def __init__(self, detector, window=15.0, min_seconds=10.0, lo=45, hi=180,
+                 snr_min=0.8, detect_every=2, hold=10.0):
+        self.detector, self.window, self.min_seconds = detector, window, min_seconds
+        self.lo, self.hi, self.snr_min = lo, hi, snr_min
+        self.detect_every, self.hold = detect_every, hold
+        self.buf = deque()
+        self.box = None
+        self.rois = []
+        self.n = 0
+        self.miss_since = None
+        self.last_est = None
+        self.bpm, self.bpm_ts, self.cands, self.alt = None, -1e9, [], []
+        self.last_good, self.last_good_ts = None, -1e9   # última leitura confiável (referência de plausibilidade)
+        self.status = "medindo..."
+        self.last_snr, self.last_raw = 0.0, None
+
+    # --- entrada de frames ---
+    def update(self, frame, ts):
+        self.n += 1
+        if self.box is None or self.n % self.detect_every == 0:
+            box = self.detector.detect(frame)
+            if box is None:
+                if self.miss_since is None:
+                    self.miss_since = ts
+                if ts - self.miss_since > 1.0:
+                    self.box, self.rois = None, []
+                    self.buf.clear()
+                    self.status = "erro no rosto" if getattr(self.detector, "broken", False) else "sem rosto"
+                    return
+            else:
+                self.miss_since = None
+                b = np.array(box, float)
+                if self.box is None or np.abs(b[:2] - self.box[:2]).max() > 0.5 * self.box[2]:
+                    self.box = b
+                else:
+                    self.box = 0.6 * self.box + 0.4 * b
+        if self.box is None:
+            return
+        sample = self._sample(frame)
+        if sample is not None:
+            self.buf.append((ts,) + sample)
+            while self.buf and self.buf[0][0] < ts - (self.window + 3.0):
+                self.buf.popleft()
+        if self.last_est is None:
+            self.last_est = ts
+        if ts - self.last_est >= 1.0:
+            self._estimate(ts)
+
+    def _sample(self, frame):
+        """Cor média (R,G,B) de cada região. Devolve 9 valores ou None se alguma região for inválida."""
+        h, w = frame.shape[:2]
+        x, y, bw, bh = self.box
+        vals, rois = [], []
+        for fx0, fy0, fx1, fy1 in self.REGIONS:
+            x0, x1 = int(max(0, x + fx0 * bw)), int(min(w, x + fx1 * bw))
+            y0, y1 = int(max(0, y + fy0 * bh)), int(min(h, y + fy1 * bh))
+            if x1 - x0 < 4 or y1 - y0 < 4:
+                self.rois = rois
+                return None
+            b, g, r = cv2.mean(frame[y0:y1, x0:x1])[:3]
+            rois.append((x0, y0, x1, y1))
+            if not 20 < (b + g + r) / 3 < 245:       # região escura demais ou estourada
+                self.rois = rois
+                return None
+            vals += [r, g, b]
+        self.rois = rois
+        return tuple(vals)
+
+    # --- estimativa ---
+    def _estimate(self, now):
+        self.last_est = now
+        arr = np.array(self.buf)
+        if len(arr) < 30 or arr[-1, 0] - arr[0, 0] < self.min_seconds:
+            self.status = "medindo..."
+            return
+        t = arr[:, 0]
+        fs = 30.0
+        tu = np.arange(max(t[0], t[-1] - self.window), t[-1], 1.0 / fs)
+        spectra, weights = [], []
+        for r in range(3):
+            rgb = np.stack([np.interp(tu, t, arr[:, 1 + 3 * r + k]) for k in range(3)], axis=1)
+            f, p = power_spectrum(pos_signal(rgb, fs), fs)
+            pb = p[(f >= self.lo) & (f <= self.hi)]
+            weights.append(pb.max() / (pb.mean() + 1e-12))   # "nitidez" do pico: quanto melhor a região, mais pesa
+            spectra.append(p / (pb.sum() + 1e-12))
+        w = np.array(weights) / np.sum(weights)
+        spec = sum(wi * si for wi, si in zip(w, spectra))
+
+        full = peak_from_spectrum(f, spec, self.lo, self.hi)
+        if full is None:
+            return
+        self.last_raw, self.last_snr = full
+        if self.value(now) is not None:
+            self._track(f, spec, full, now)
+            return
+        # sem leitura travada: busca. Se houve leitura confiável há menos de 60 s, só aceita picos
+        # plausíveis (±25 bpm dela); na dúvida mostra "sinal fraco" em vez de um valor absurdo.
+        limite = self.snr_min
+        if self.last_good is not None and now - self.last_good_ts < 60.0:
+            res = peak_from_spectrum(f, spec, self.lo, self.hi, around=self.last_good, radius=25.0)
+            limite = self.snr_min * 1.25
+        else:
+            res = full
+        if res is None or res[1] < limite or res[0] < self.lo + 5 or res[0] > self.hi - 5:   # colado na borda = ruído
+            self.cands, self.status = [], "sinal fraco"
+            return
+        self.status = "ok"
+        self.cands = (self.cands + [res[0]])[-3:]
+        if len(self.cands) == 3 and max(self.cands) - min(self.cands) <= 6:
+            self.bpm, self.bpm_ts, self.cands, self.alt = float(np.median(self.cands)), now, [], []
+            self.last_good, self.last_good_ts = self.bpm, now
+
+    def _track(self, f, spec, full, now):
+        """Com leitura travada: só acompanha o pico perto do valor atual (±15 bpm)."""
+        tr = peak_from_spectrum(f, spec, self.lo, self.hi, around=self.bpm, radius=15.0)
+        if tr is not None and tr[1] >= self.snr_min:
+            self.status = "ok"
+            self.last_raw, self.last_snr = tr
+            self.bpm += 0.3 * (tr[0] - self.bpm)
+            self.bpm_ts = now
+            self.last_good, self.last_good_ts = self.bpm, now
+        else:
+            self.status = "sinal fraco"
+        # Troca de frequência (caso a trava tenha sido em ruído): só se OUTRO pico bem forte persistir
+        # por ~30 estimativas seguidas. Mudanças reais de pulso são graduais e o acompanhamento já cobre.
+        peak, snr = full
+        if abs(peak - self.bpm) > 15 and snr >= self.snr_min * 2 and self.lo + 5 <= peak <= self.hi - 5:
+            self.alt = (self.alt + [peak])[-30:]
+            if len(self.alt) == 30 and max(self.alt) - min(self.alt) <= 8:
+                self.bpm, self.bpm_ts, self.alt = float(np.median(self.alt)), now, []
+                self.last_good, self.last_good_ts = self.bpm, now
+        else:
+            self.alt = []
+
+    # --- saída ---
+    def value(self, now):
+        if self.bpm is not None and now - self.bpm_ts <= self.hold:
+            return self.bpm
+        return None
+
+    def message(self, now):
+        return "--" if self.value(now) is not None else self.status
+
+    def draw_debug(self, img):
+        if self.box is not None:
+            x, y, w, h = (int(v) for v in self.box)
+            cv2.rectangle(img, (x, y), (x + w, y + h), (0, 255, 0), 1)
+        for x0, y0, x1, y1 in self.rois:
+            cv2.rectangle(img, (x0, y0), (x1, y1), (0, 200, 255), 1)
+        raw = "-" if self.last_raw is None else f"{self.last_raw:.0f}"
+        trava = "travado" if self.bpm is not None and self.bpm_ts > -1e8 else "buscando"
+        cv2.putText(img, f"rPPG: bruto {raw} | snr {self.last_snr:.2f} | {self.status} | {trava}", (10, 58),
+                    cv2.FONT_HERSHEY_SIMPLEX, 0.6, (0, 255, 255), 2, cv2.LINE_AA)
+
+
+class HeartLabel:
+    """Label inferior central: coração que bate no ritmo do BPM (gelado = baixo, quente = alto)."""
+
+    # (posição 0..1 na faixa bpm_min..bpm_max, cor RGB): gelo -> rosa -> vermelho
+    STOPS = [(0.0, (120, 200, 255)), (0.5, (255, 105, 150)), (1.0, (255, 60, 30))]
+
+    def __init__(self, bpm_min=50, bpm_max=120, show_number=True):
+        self.bpm_min = float(bpm_min)
+        self.bpm_max = max(float(bpm_max), self.bpm_min + 1.0)
+        self.show_number = show_number
+        self.phase = 0.0       # fase da batida (contínua: o ritmo muda sem "pular")
+        self.shown = None      # BPM suavizado
+        self.last_t = None
+        t = np.linspace(0, 2 * np.pi, 90)
+        x = 16 * np.sin(t) ** 3
+        y = -(13 * np.cos(t) - 5 * np.cos(2 * t) - 2 * np.cos(3 * t) - np.cos(4 * t))
+        pts = np.stack([x, y], axis=1)
+        pts -= (pts.max(axis=0) + pts.min(axis=0)) / 2
+        self.unit = pts / np.abs(pts).max()
+
+    def color(self, bpm):
+        u = float(np.clip((bpm - self.bpm_min) / (self.bpm_max - self.bpm_min), 0.0, 1.0))
+        for (u0, c0), (u1, c1) in zip(self.STOPS, self.STOPS[1:]):
+            if u <= u1:
+                f = (u - u0) / (u1 - u0)
+                r, g, b = (c0[i] + (c1[i] - c0[i]) * f for i in range(3))
+                break
+        return (int(b), int(g), int(r))  # BGR
+
+    @staticmethod
+    def beat(seconds):
+        """Escala do coração: batida dupla ("tum-tum") ao longo de um ciclo."""
+        p1 = np.exp(-((seconds - 0.08) / 0.07) ** 2)
+        p2 = np.exp(-((seconds - 0.30) / 0.07) ** 2)
+        return 1.0 + 0.30 * p1 + 0.18 * p2
+
+    def draw(self, img, bpm, now, msg="--"):
+        h, w = img.shape[:2]
+        dt = 0.0 if self.last_t is None else min(now - self.last_t, 0.25)
+        self.last_t = now
+
+        if bpm is None:                      # sem leitura: coração cinza e parado
+            color, scale, label = (150, 150, 150), 1.0, msg
+        else:
+            bpm = float(np.clip(bpm, 30, 200))
+            self.shown = bpm if self.shown is None else self.shown + (bpm - self.shown) * min(1.0, dt * 3.0)
+            self.phase = (self.phase + dt * self.shown / 60.0) % 1.0
+            scale = self.beat(self.phase * 60.0 / self.shown)
+            color, label = self.color(self.shown), f"{int(round(self.shown))} BPM"
+        if not self.show_number:
+            label = ""
+
+        base = h * 0.034                     # meia-largura do coração em repouso
+        reserve = base * 1.32                # espaço para o pico da batida
+        font = cv2.FONT_HERSHEY_DUPLEX
+        fs, th = h / 720 * 0.85, max(1, int(round(h / 720 * 2)))
+        tw, tht = (cv2.getTextSize(label, font, fs, th)[0] if label else (0, 0))
+        gap = base * 0.7 if label else 0.0
+        pad = base * 0.75
+        pill_w = int(2 * reserve + gap + tw + 2 * pad)
+        pill_h = int(2 * reserve + 1.2 * pad)
+        x0 = max(0, (w - pill_w) // 2)
+        y1 = h - int(h * 0.035)
+        y0 = max(0, y1 - pill_h)
+        x1 = min(w, x0 + pill_w)
+
+        # fundo escuro translúcido em formato de pílula (só na região pequena do label)
+        roi = img[y0:y1, x0:x1]
+        mh, mw = roi.shape[:2]
+        mask = np.zeros((mh, mw), np.uint8)
+        r = mh // 2
+        cv2.rectangle(mask, (r, 0), (max(r, mw - r - 1), mh - 1), 255, -1)
+        cv2.circle(mask, (r, r), r, 255, -1, cv2.LINE_AA)
+        cv2.circle(mask, (max(r, mw - r - 1), r), r, 255, -1, cv2.LINE_AA)
+        a = (cv2.GaussianBlur(mask, (0, 0), 1.2).astype(np.float32) / 255.0 * 0.5)[..., None]
+        roi[:] = (roi * (1.0 - a)).astype(np.uint8)
+
+        cx, cy = x0 + pad + reserve, (y0 + y1) / 2.0
+        pts = (self.unit * (base * scale) + np.array([cx, cy])).astype(np.int32)
+        cv2.fillPoly(img, [pts], color, cv2.LINE_AA)
+        cv2.polylines(img, [pts], True, tuple(int(c * 0.6) for c in color), 1, cv2.LINE_AA)
+        if label:
+            org = (int(x0 + pad + 2 * reserve + gap), int(cy + tht / 2))
+            cv2.putText(img, label, org, font, fs, (255, 255, 255), th, cv2.LINE_AA)
+
+
 def parse_color(hexstr):
     hexstr = hexstr.lstrip("#")
     r, g, b = (int(hexstr[i:i + 2], 16) for i in (0, 2, 4))
@@ -352,6 +742,19 @@ def main():
                    help="roda a IA a cada N frames e reaproveita a máscara (2 = ~2x mais FPS)")
     p.add_argument("--profile", action="store_true",
                    help="mostra o tempo (ms) de cada etapa por frame")
+    p.add_argument("--coracao", action="store_true",
+                   help="mostra embaixo um coração que bate no ritmo do BPM")
+    p.add_argument("--bpm-teste", type=float, default=None,
+                   help="BPM manual para o coração (padrão 75; ativa --coracao)")
+    p.add_argument("--bpm-min", type=float, default=50, help="BPM da cor mais gelada")
+    p.add_argument("--bpm-max", type=float, default=120, help="BPM da cor mais quente")
+    p.add_argument("--bpm-sem-numero", action="store_true", help="coração sem o número")
+    p.add_argument("--bpm-camera", action="store_true",
+                   help="mede o BPM pela câmera (rPPG) e mostra no coração")
+    p.add_argument("--bpm-snr", type=float, default=0.8,
+                   help="confiança mínima para aceitar a leitura (menor = mais sensível, mais erros)")
+    p.add_argument("--bpm-debug", action="store_true",
+                   help="mostra no preview o rosto, as regiões medidas e a confiança")
     p.add_argument("--list-cameras", action="store_true",
                    help="testa os índices de câmera e mostra uma prévia de cada")
     setup_pythonw_log()
@@ -368,6 +771,11 @@ def main():
 
     matter = Matter(ensure_model(args.model), args.infer_width, args.ratio,
                     args.device, args.edge, args.shrink, args.threads)
+
+    hr = None
+    if args.bpm_camera:
+        det = build_face_detector()
+        hr = HeartRate(det, snr_min=args.bpm_snr) if det is not None else None
 
     cap = cv2.VideoCapture(args.camera, cv2.CAP_DSHOW)
     cap.set(cv2.CAP_PROP_FOURCC, cv2.VideoWriter_fourcc(*"MJPG"))
@@ -407,8 +815,12 @@ def main():
     last_ai = 0
     period = 1.0 / args.fps if args.fps > 0 else 0.0
     next_t = time.perf_counter()
+    heart = (HeartLabel(args.bpm_min, args.bpm_max, not args.bpm_sem_numero)
+             if (args.coracao or args.bpm_teste is not None or args.bpm_camera) else None)
+    test_bpm = args.bpm_teste if args.bpm_teste is not None else 75.0
+    show_heart = True
     pc = time.perf_counter
-    acc = {"leitura": 0.0, "ia": 0.0, "fluxo": 0.0, "composicao": 0.0, "envio": 0.0}
+    acc = {"leitura": 0.0, "ia": 0.0, "fluxo": 0.0, "composicao": 0.0, "overlay": 0.0, "bpm": 0.0, "envio": 0.0}
     t0, frames, fps_txt = time.time(), 0, ""
     try:
         while True:
@@ -420,6 +832,11 @@ def main():
             if args.mirror:
                 frame = cv2.flip(frame, 1)
             acc["leitura"] += pc() - t
+
+            if hr is not None:
+                t = pc()
+                hr.update(frame, grab.frame_ts)
+                acc["bpm"] += pc() - t
 
             if mode == "none":
                 out = frame
@@ -443,6 +860,15 @@ def main():
                 out = compose(frame, a8, bg)
                 acc["composicao"] += pc() - t
 
+            if heart is not None and show_heart:
+                t = pc()
+                if args.bpm_camera:
+                    heart.draw(out, hr.value(t) if hr else None, t,
+                               hr.message(t) if hr else "sem modelo")
+                else:
+                    heart.draw(out, test_bpm, t)
+                acc["overlay"] += pc() - t
+
             t = pc()
             if vcam is not None:
                 vcam.send(out)
@@ -464,6 +890,8 @@ def main():
 
             if args.preview:
                 view = out.copy()
+                if hr is not None and args.bpm_debug:
+                    hr.draw_debug(view)
                 cv2.putText(view, f"{mode} | {fps_txt}", (10, 28),
                             cv2.FONT_HERSHEY_SIMPLEX, 0.8, (255, 255, 255), 2)
                 cv2.imshow("camfundo", view)
@@ -478,6 +906,12 @@ def main():
                     mode = "image"
                 elif k == ord("n"):
                     mode = "none"
+                elif k in (ord("+"), ord("=")):
+                    test_bpm = min(200.0, test_bpm + 5)
+                elif k in (ord("-"), ord("_")):
+                    test_bpm = max(30.0, test_bpm - 5)
+                elif k == ord("h"):
+                    show_heart = not show_heart
 
             # limita a taxa de processamento ao valor de --fps
             if period > 0:
